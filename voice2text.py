@@ -2,7 +2,6 @@ import whisper
 import pyaudio
 import wave
 import os
-import tempfile
 import time
 import torch
 import threading
@@ -12,9 +11,7 @@ import uuid
 import requests
 from pathlib import Path
 from dotenv import load_dotenv
-from tqdm import tqdm
-from fastapi import FastAPI, UploadFile, File, BackgroundTasks, Form, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from pydantic import BaseModel
 import uvicorn
 from typing import Optional, Dict, Any
