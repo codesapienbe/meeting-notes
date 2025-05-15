@@ -1,0 +1,11 @@
+[server]
+# Disable file watcher to prevent the torch.__path__ error
+fileWatcherType = "none"
+
+[runner]
+# Ignore torch and whisper modules to prevent errors
+moduleExcludedFromWatching = ["torch", "whisper", "av"]
+
+[browser]
+# Make Streamlit quieter by sending less telemetry
+gatherUsageStats = false 

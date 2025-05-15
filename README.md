@@ -4,7 +4,7 @@ This application uses OpenAI's Whisper model locally to provide real-time Turkis
 
 ## Version
 
-**fhisper.py** - Minimalist Turkish speech transcription that outputs only clean text with natural pauses
+**voice2text.py** - Minimalist Turkish speech transcription that outputs only clean text with natural pauses
 
 ## Requirements
 
