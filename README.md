@@ -74,4 +74,66 @@ To use a different language, edit these values in `fhisper.py`:
 - Records in 5-second chunks
 - Enforces minimum 5-second spacing between outputs
 - Runs three parallel threads for recording, transcription and display
-- Silent operation with no progress indicators 
+- Silent operation with no progress indicators
+
+# Whisper Voice Typing
+
+Voice typing and transcription application using Whisper.
+
+## Setup
+
+1. Install the required dependencies:
+
+```bash
+pip install -r requirements.txt
+```
+
+2. Make sure Docker is installed and running on your system.
+
+3. Set up environment variables by creating a `.env` file:
+
+```
+GROQ_API_KEY=your_groq_api_key_here
+```
+
+## Running the Application
+
+Instead of using docker-compose, you can now use the Python script to run all components:
+
+```bash
+python run.py
+```
+
+This script will:
+1. Start a Redis container using Docker
+2. Start the Celery worker for background processing
+3. Start the FastAPI application
+
+The API will be available at http://localhost:8000
+
+### Redis Port Configuration
+
+The script automatically handles Redis port configurations:
+
+- If port 6379 is already in use, it will automatically find and use another available port
+- If Redis is already running on port 6379, it will use that existing instance instead of starting a new container
+- The Celery worker and FastAPI application will automatically connect to whichever port Redis is using
+
+### Troubleshooting
+
+If you encounter errors related to Redis or port availability:
+
+1. You can manually modify the `REDIS_PORT` variable in `run.py` if needed
+2. Check if you have an existing Redis service running (`redis-server` or another container)
+3. Use `docker ps` to check for running containers that might be using the Redis port
+
+## Stopping the Application
+
+Press Ctrl+C to stop all processes and the Redis container.
+
+## API Endpoints
+
+- `POST /transcribe` - Upload an audio file for transcription
+- `POST /summarize` - Summarize a text
+- `GET /task/{task_id}` - Check the status of a task
+- `GET /models` - Get available models 

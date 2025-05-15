@@ -46,7 +46,7 @@ GROQ_MODEL = "llama3-70b-8192"  # Can be changed to other Groq models
 
 # Setup Celery
 # Define in a way that it can be imported by the Celery worker
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
 celery_app = Celery("voice2text_tasks", broker=REDIS_URL, backend=REDIS_URL)
 celery_app.conf.task_routes = {
     "voice2text_tasks.transcribe_task": {"queue": "transcription"},
