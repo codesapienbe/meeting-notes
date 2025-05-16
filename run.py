@@ -7,6 +7,8 @@ import threading
 import signal
 import sys
 import socket
+import argparse
+import psutil
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -16,6 +18,14 @@ load_dotenv()
 REDIS_CONTAINER_NAME = "redis-server"
 REDIS_PORT = 6379
 REDIS_IMAGE = "redis:latest"
+
+def parse_arguments():
+    """Parse command line arguments"""
+    parser = argparse.ArgumentParser(description="Run the Whisper transcription application")
+    parser.add_argument("-w", "--workers", type=int, default=1, help="Number of Celery worker processes (default: 1)")
+    parser.add_argument("--kill-existing", action="store_true", default=True, help="Kill existing Celery processes before starting")
+    parser.add_argument("--reset-redis", action="store_true", help="Completely reset Redis database before starting")
+    return parser.parse_args()
 
 def is_port_in_use(port):
     """Check if a port is already in use"""
@@ -41,6 +51,47 @@ def check_redis_connection(host='localhost', port=6379):
     except:
         pass
     return False
+
+def kill_existing_celery_processes():
+    """Kill any existing Celery worker processes"""
+    killed = 0
+    
+    # Method 1: Use psutil to find and kill processes
+    for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+        try:
+            cmdline = proc.info.get('cmdline', [])
+            # Look for both 'celery' and 'tasks.py' to catch our specific processes
+            if cmdline and (
+                (any('celery' in cmd.lower() for cmd in cmdline) and 'worker' in cmdline) or
+                (any('tasks.py' in cmd for cmd in cmdline))
+            ):
+                print(f"Killing existing Celery worker process: {proc.pid}")
+                proc.kill()
+                killed += 1
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            pass
+    
+    # Method 2: Use system commands as backup
+    try:
+        if sys.platform == 'darwin' or sys.platform.startswith('linux'):
+            # On macOS/Linux, use pkill
+            subprocess.run(["pkill", "-f", "celery worker"], stderr=subprocess.DEVNULL)
+            subprocess.run(["pkill", "-f", "tasks.py"], stderr=subprocess.DEVNULL)
+        elif sys.platform == 'win32':
+            # On Windows, use taskkill
+            subprocess.run(["taskkill", "/f", "/im", "celery.exe"], stderr=subprocess.DEVNULL)
+            subprocess.run(["taskkill", "/f", "/fi", "IMAGENAME eq python.exe", "/fi", "WINDOWTITLE eq *celery*"], stderr=subprocess.DEVNULL)
+    except Exception as e:
+        print(f"Warning: System command process killing failed: {e}")
+    
+    if killed > 0:
+        print(f"Killed {killed} existing Celery worker processes")
+        # Give processes time to fully terminate
+        time.sleep(2)
+    else:
+        print("No existing Celery worker processes found")
+    
+    return killed
 
 def start_redis():
     """Start Redis container using Docker Python SDK"""
@@ -110,13 +161,37 @@ def start_redis():
         print(f"Error starting Redis container: {str(e)}")
         sys.exit(1)
 
-def start_celery_worker():
+def flush_redis_celery_keys():
+    """Flush only Celery-related keys from Redis to clear stuck tasks"""
+    try:
+        import redis
+        r = redis.Redis(host='localhost', port=REDIS_PORT, db=0)
+        
+        # Clear all Celery-related keys (more comprehensive patterns)
+        patterns = ['celery*', 'unacked*', '_kombu*', 'worker*', 'task*']
+        total_deleted = 0
+        
+        for pattern in patterns:
+            keys = r.keys(pattern)
+            if keys:
+                count = r.delete(*keys)
+                total_deleted += count
+                print(f"Deleted {count} Redis keys matching '{pattern}'")
+        
+        print(f"Total: Flushed {total_deleted} potentially stale Redis keys")
+        return True
+    except Exception as e:
+        print(f"Failed to flush Redis keys: {e}")
+        return False
+
+def start_celery_worker(worker_count=1):
     """Start Celery worker from tasks.py"""
-    print("Starting Celery worker...")
+    print(f"Starting Celery worker with {worker_count} worker processes...")
     env = os.environ.copy()
     env["REDIS_URL"] = f"redis://localhost:{REDIS_PORT}/0"
     env["REDIS_HOST"] = "localhost"
     env["REDIS_PORT"] = str(REDIS_PORT)
+    env["WORKER_COUNT"] = str(worker_count)
     
     # Ensure GROQ_API_KEY is passed to the worker
     if "GROQ_API_KEY" in os.environ:
@@ -181,15 +256,74 @@ def cleanup(redis_container, processes):
         except Exception as e:
             print(f"Error stopping Redis container: {str(e)}")
 
+def nuke_redis_if_worker_duplicates():
+    """Nuclear option: reset Redis completely if we've had persistent issues with duplicates"""
+    try:
+        redis_keys_file = "data/redis_reset_tracker.txt"
+        duplicate_warnings_count = 0
+        
+        # Check if we have a tracking file
+        if os.path.exists(redis_keys_file):
+            with open(redis_keys_file, "r") as f:
+                try:
+                    duplicate_warnings_count = int(f.read().strip())
+                except:
+                    duplicate_warnings_count = 0
+        
+        # Increment the count - we only get here if we've seen a DuplicateNodenameWarning
+        duplicate_warnings_count += 1
+        
+        # Store the updated count
+        os.makedirs(os.path.dirname(redis_keys_file), exist_ok=True)
+        with open(redis_keys_file, "w") as f:
+            f.write(str(duplicate_warnings_count))
+        
+        # If we've seen multiple warnings in a row, take drastic action
+        if duplicate_warnings_count >= 2:
+            print(f"WARNING: Detected {duplicate_warnings_count} consecutive duplicate warnings.")
+            print("Performing FULL Redis flush to resolve persistent node duplicates.")
+            import redis
+            r = redis.Redis(host='localhost', port=REDIS_PORT, db=0)
+            r.flushall()
+            print("✓ Redis database COMPLETELY reset. All keys removed.")
+            
+            # Reset the counter after taking action
+            with open(redis_keys_file, "w") as f:
+                f.write("0")
+            
+            return True
+    except Exception as e:
+        print(f"Error in nuke_redis function: {e}")
+    
+    return False
+
 def main():
+    # Parse command line arguments
+    args = parse_arguments()
+    
+    # Kill existing Celery processes if requested
+    if args.kill_existing:
+        kill_existing_celery_processes()
+    
     # Start Redis container
     redis_container = start_redis()
     
     # Wait for Redis to be fully up
     time.sleep(3)
     
+    # Check if we need to reset Redis completely
+    if args.reset_redis:
+        print("Performing complete Redis reset as requested...")
+        import redis
+        r = redis.Redis(host='localhost', port=REDIS_PORT, db=0)
+        r.flushall()
+        print("✓ Redis database completely reset")
+    else:
+        # Clean stale Celery tasks
+        flush_redis_celery_keys()
+    
     # Start Celery worker and FastAPI app
-    celery_process = start_celery_worker()
+    celery_process = start_celery_worker(args.workers)
     fastapi_process = start_fastapi()
     
     processes = [celery_process, fastapi_process]
