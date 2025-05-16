@@ -197,13 +197,13 @@ def main():
     # Setup log threads
     celery_log_thread = threading.Thread(
         target=log_output, 
-        args=(celery_process, "CELERY"),
+        args=(celery_process, "MEETING-NOTES-WORKER"),
         daemon=True
     )
     
     fastapi_log_thread = threading.Thread(
         target=log_output, 
-        args=(fastapi_process, "API"),
+        args=(fastapi_process, "MEETING-NOTES-API"),
         daemon=True
     )
     

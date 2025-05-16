@@ -61,14 +61,14 @@ GROQ_MODEL = "llama3-70b-8192"  # Can be changed to other Groq models
 # Setup Celery
 # Define in a way that it can be imported by the Celery worker
 REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
-celery_app = Celery("voice2text_tasks", broker=REDIS_URL, backend=REDIS_URL)
+celery_app = Celery("meeting_notes_tasks", broker=REDIS_URL, backend=REDIS_URL)
 celery_app.conf.task_routes = {
-    "voice2text_tasks.transcribe_task": {"queue": "transcription"},
-    "voice2text_tasks.summarize_task": {"queue": "summarization"}
+    "meeting_notes_tasks.transcribe_task": {"queue": "transcription"},
+    "meeting_notes_tasks.summarize_task": {"queue": "summarization"}
 }
 
 # Create FastAPI app
-app = FastAPI(title="Voice2Text API", description="API for transcribing audio to text and summarizing")
+app = FastAPI(title="Meeting Notes", description="API for transcribing meeting audio to text and summarizing meeting notes")
 
 # Pydantic models for API
 class SummarizeRequest(BaseModel):
@@ -328,7 +328,7 @@ def export_to_json(recording_data, transcription_data, audio_filename=None, summ
     return filename, metadata
 
 # Register Celery tasks
-@celery_app.task(name="voice2text_tasks.transcribe_task")
+@celery_app.task(name="meeting_notes_tasks.transcribe_task")
 def transcribe_task(file_path, save_output=True, language=None, initial_prompt=None):
     """Celery task to transcribe audio file only (no summarization)"""
     if not os.path.exists(file_path):
@@ -412,7 +412,7 @@ def transcribe_task(file_path, save_output=True, language=None, initial_prompt=N
             os.remove(file_path)
         return {"error": f"Error processing file: {str(e)}"}
 
-@celery_app.task(name="voice2text_tasks.summarize_task")
+@celery_app.task(name="meeting_notes_tasks.summarize_task")
 def summarize_task(text):
     """Celery task to summarize text using Groq API"""
     return summarize_with_groq(text)
@@ -420,7 +420,7 @@ def summarize_task(text):
 # API Endpoints
 @app.get("/")
 async def root():
-    return {"message": "Voice2Text API", "status": "running", "model": MODEL_NAME, "device": device}
+    return {"message": "Meeting Notes API", "status": "running", "model": MODEL_NAME, "device": device}
 
 @app.post("/transcribe", response_model=TaskResponse)
 async def transcribe_endpoint(

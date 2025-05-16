@@ -1,10 +1,10 @@
-# Turkish Speech Recognition System
+# Meeting Notes
 
-This application uses OpenAI's Whisper model locally to provide real-time Turkish speech-to-text transcription with a clean, minimal interface.
+This application uses OpenAI's Whisper model locally to provide real-time Turkish speech-to-text transcription for meeting notes with a clean, minimal interface.
 
 ## Version
 
-**voice2text.py** - Minimalist Turkish speech transcription that outputs only clean text with natural pauses
+**meeting-notes** - Turkish meeting transcription that outputs clean text with natural pauses
 
 ## Requirements
 
@@ -76,9 +76,9 @@ To use a different language, edit these values in `fhisper.py`:
 - Runs three parallel threads for recording, transcription and display
 - Silent operation with no progress indicators
 
-# Whisper Voice Typing
+# Meeting Notes
 
-Voice typing and transcription application using Whisper.
+Meeting transcription and summarization application using Whisper.
 
 ## Setup
 
@@ -138,13 +138,13 @@ Press Ctrl+C to stop all processes and the Redis container.
 
 ## API Endpoints
 
-- `POST /transcribe` - Upload an audio file for transcription
+- `POST /transcribe` - Upload a meeting audio file for transcription
   - Optional query parameters:
     - `language`: Language code (e.g., 'tr' for Turkish, 'en' for English)
     - `initial_prompt`: Custom prompt to guide the transcription
     - `save_output`: Whether to save the output to a JSON file (default: false)
 
-- `POST /summarize` - Summarize a text
+- `POST /summarize` - Summarize meeting notes
 
 - `GET /task/{task_id}` - Check the status of a task
 
