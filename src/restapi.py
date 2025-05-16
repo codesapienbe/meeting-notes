@@ -1,3 +1,13 @@
+import os
+import sys
+
+# Add the parent directory to the path so imports work consistently
+current_dir = os.path.dirname(os.path.abspath(__file__))
+parent_dir = os.path.dirname(current_dir)
+if parent_dir not in sys.path:
+    sys.path.insert(0, parent_dir)
+    sys.path.insert(0, current_dir)
+
 import whisper
 import pyaudio
 import wave
@@ -14,13 +24,17 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from pydantic import BaseModel
 import uvicorn
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 import shutil
 from celery import Celery
 from celery.result import AsyncResult
+from src.dbmgr import TaskDatabaseManager
 
 # Load environment variables
 load_dotenv()
+
+# Initialize database manager
+db_manager = TaskDatabaseManager()
 
 # Check if GPU is available (quiet check)
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -439,6 +453,16 @@ async def transcribe_endpoint(
             language,
             initial_prompt
         )
+        
+        # Save task information to database
+        options = {
+            "save_output": save_output,
+            "language": language,
+            "initial_prompt": initial_prompt,
+            "file_path": temp_file_path
+        }
+        db_manager.save_task(task.id, "transcribe", "PENDING", options)
+        
         return {
             "task_id": task.id,
             "status": "PENDING",
@@ -466,6 +490,13 @@ async def summarize_endpoint(request: SummarizeRequest):
     
     try:
         task = summarize_task.delay(request.text)
+        
+        # Save task information to database
+        options = {
+            "text_length": len(request.text)
+        }
+        db_manager.save_task(task.id, "summarize", "PENDING", options)
+        
         return {
             "task_id": task.id,
             "status": "PENDING",
@@ -481,6 +512,18 @@ async def get_task_status(task_id: str):
     
     - **task_id**: ID of the task to check
     """
+    # First check if we have the result in the database
+    task_with_response = db_manager.get_task_with_response(task_id)
+    
+    if task_with_response and "result" in task_with_response:
+        # Return result from database
+        return {
+            "task_id": task_id,
+            "status": task_with_response["status"],
+            "result": task_with_response["result"]
+        }
+    
+    # If not in database or no result yet, check Celery
     task_result = AsyncResult(task_id, app=celery_app)
     
     response = {
@@ -488,11 +531,28 @@ async def get_task_status(task_id: str):
         "status": task_result.status
     }
     
+    # Update task status in database
+    db_manager.update_task_status(task_id, task_result.status)
+    
     if task_result.ready():
         if task_result.successful():
-            response["result"] = task_result.get()
+            result = task_result.get()
+            response["result"] = result
+            
+            # Save response to database
+            db_manager.save_task_response(task_id, result)
+            
+            # Remove task from Celery backend
+            task_result.forget()
         else:
-            response["result"] = {"error": str(task_result.result)}
+            error = {"error": str(task_result.result)}
+            response["result"] = error
+            
+            # Save error response to database
+            db_manager.save_task_response(task_id, error)
+            
+            # Remove task from Celery backend
+            task_result.forget()
     
     return response
 
@@ -503,15 +563,41 @@ async def get_transcription_text(task_id: str):
     
     - **task_id**: ID of the transcription task
     """
+    # First check if we have the result in the database
+    task_with_response = db_manager.get_task_with_response(task_id)
+    
+    if task_with_response and "result" in task_with_response:
+        result = task_with_response["result"]
+        
+        if "error" in result:
+            raise HTTPException(status_code=500, detail=result["error"])
+        
+        if "transcription" not in result or "text" not in result["transcription"]:
+            raise HTTPException(status_code=500, detail="No transcription text found in result")
+        
+        return {"text": result["transcription"]["text"]}
+    
+    # If not in database, check Celery
     task_result = AsyncResult(task_id, app=celery_app)
     
     if not task_result.ready():
         raise HTTPException(status_code=400, detail="Task is not complete yet")
     
     if not task_result.successful():
+        error = {"error": str(task_result.result)}
+        # Save error response to database
+        db_manager.save_task_response(task_id, error)
+        # Remove task from Celery backend
+        task_result.forget()
         raise HTTPException(status_code=500, detail=f"Task failed: {str(task_result.result)}")
     
     result = task_result.get()
+    
+    # Save result to database
+    db_manager.save_task_response(task_id, result)
+    
+    # Remove task from Celery backend
+    task_result.forget()
     
     if "error" in result:
         raise HTTPException(status_code=500, detail=result["error"])
@@ -520,6 +606,16 @@ async def get_transcription_text(task_id: str):
         raise HTTPException(status_code=500, detail="No transcription text found in result")
     
     return {"text": result["transcription"]["text"]}
+
+@app.get("/tasks", response_model=List[Dict[str, Any]])
+async def list_tasks(limit: int = 100, offset: int = 0):
+    """
+    List recent tasks with pagination
+    
+    - **limit**: Maximum number of tasks to return
+    - **offset**: Number of tasks to skip
+    """
+    return db_manager.list_tasks(limit, offset)
 
 @app.get("/models")
 async def get_models():
@@ -555,4 +651,4 @@ async def get_models():
 
 if __name__ == "__main__":
     ensure_export_directory()
-    uvicorn.run("voice2text:app", host="0.0.0.0", port=8000, reload=True) 
+    uvicorn.run("restapi:app", host="0.0.0.0", port=8000, reload=True) 
