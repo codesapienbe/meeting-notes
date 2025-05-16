@@ -103,34 +103,46 @@ GROQ_API_KEY=your_groq_api_key_here
 
 ## Running the Application
 
-Instead of using docker-compose, you can now use the Python script to run all components:
+You can run the application with a single command, including the GUI option:
+
+```bash
+python run.py --gui
+```
+
+This will:
+1. Start all backend components (Redis, Celery worker, FastAPI)
+2. Launch the Streamlit frontend
+3. Provide a unified logging view for all components
+4. Handle graceful shutdown of all components when you press Ctrl+C
+
+### Command Line Options
+
+The `run.py` script accepts these command-line arguments:
+
+- `--workers N` or `-w N`: Specify the number of Celery worker processes (default: 1)
+- `--kill-existing`: Kill existing Celery processes before starting (default: true)
+- `--reset-redis`: Completely reset Redis database before starting
+- `--gui`: Start the Streamlit frontend GUI
+
+### Backend Services Only
+
+If you want to run only the backend services without the GUI:
 
 ```bash
 python run.py
 ```
 
-This script will:
-1. Start a Redis container using Docker
-2. Start the Celery worker for background processing
-3. Start the FastAPI application
-
 The API will be available at http://localhost:8000
 
-### Redis Port Configuration
+### Frontend Only
 
-The script automatically handles Redis port configurations:
+If you already have the backend running and want to start only the frontend:
 
-- If port 6379 is already in use, it will automatically find and use another available port
-- If Redis is already running on port 6379, it will use that existing instance instead of starting a new container
-- The Celery worker and FastAPI application will automatically connect to whichever port Redis is using
+```bash
+streamlit run webapp.py
+```
 
-### Troubleshooting
-
-If you encounter errors related to Redis or port availability:
-
-1. You can manually modify the `REDIS_PORT` variable in `run.py` if needed
-2. Check if you have an existing Redis service running (`redis-server` or another container)
-3. Use `docker ps` to check for running containers that might be using the Redis port
+The Streamlit interface will be available at http://localhost:8501
 
 ## Stopping the Application
 

@@ -1,5 +1,6 @@
 import os
 import sys
+import traceback  # Add this import for exception handling
 
 # Add the parent directory to the path so imports work consistently
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -19,6 +20,7 @@ import json
 import datetime
 import uuid
 import requests
+import asyncio
 from pathlib import Path
 from dotenv import load_dotenv
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
@@ -68,7 +70,10 @@ celery_app.conf.task_routes = {
 }
 
 # Create FastAPI app
-app = FastAPI(title="Meeting Notes", description="API for transcribing meeting audio to text and summarizing meeting notes")
+app = FastAPI(
+    title="Meeting Notes with Vector Embeddings", 
+    description="API for transcribing meeting audio to text, generating vector embeddings, and summarizing meeting notes"
+)
 
 # Pydantic models for API
 class SummarizeRequest(BaseModel):
@@ -93,6 +98,47 @@ class TaskStatusResponse(BaseModel):
     task_id: str
     status: str
     result: Optional[Dict[str, Any]] = None
+    embeddings: Optional[List[float]] = None
+
+# Import the ZeroMQ publisher from tasks module
+try:
+    from tasks import publish_task_update as zmq_publish_task_update
+    ZMQ_AVAILABLE = True
+    print("ZeroMQ publisher available - using ZeroMQ for real-time updates")
+except ImportError:
+    ZMQ_AVAILABLE = False
+    print("ZeroMQ publisher not available - falling back to database-only updates")
+
+# Function to send task updates via ZeroMQ
+def send_task_update(task_id: str, status: str, result: Dict[str, Any] = None, progress: str = None):
+    """Send a task update via ZeroMQ"""
+    # Always update the database status first
+    db_manager.update_task_status(task_id, status)
+    
+    # If we have a result, save it to the database
+    if result and status == "SUCCESS":
+        db_manager.save_task_response(task_id, result)
+    
+    # Send via ZeroMQ (sync) if available
+    if ZMQ_AVAILABLE:
+        # Prepare data for ZeroMQ
+        task_data = db_manager.get_task(task_id)
+        options = task_data.get('options') if task_data else None
+        
+        zmq_data = {
+            "result": result,
+            "progress": progress,
+            "options": options
+        }
+        
+        try:
+            # Use the imported ZeroMQ publisher
+            zmq_publish_task_update(task_id, status, zmq_data)
+            print(f"Published ZeroMQ update for task {task_id}: {status}")
+        except Exception as e:
+            print(f"Error publishing ZeroMQ update: {e}")
+    else:
+        print(f"ZeroMQ not available - status update for task {task_id} saved to database only")
 
 def ensure_export_directory():
     """Ensure the export directory exists"""
@@ -200,6 +246,20 @@ def transcribe_audio(filename, language=None, initial_prompt=None):
     
     # Add timing data to the result
     result["transcription_duration"] = transcription_duration
+    
+    # Generate embeddings if text is available
+    transcription_text = result.get("text", "").strip()
+    if transcription_text:
+        try:
+            print("Generating vector embeddings for transcription...")
+            # Use the database manager method to generate embeddings (ensures consistency)
+            result["embeddings"] = db_manager.generate_embeddings(transcription_text)
+            if result["embeddings"]:
+                print(f"Successfully generated embeddings (vector dimension: {len(result['embeddings'])})")
+            else:
+                print("Failed to generate embeddings")
+        except Exception as e:
+            print(f"Error generating embeddings: {e}")
     
     return result
 
@@ -329,93 +389,242 @@ def export_to_json(recording_data, transcription_data, audio_filename=None, summ
 
 # Register Celery tasks
 @celery_app.task(name="meeting_notes_tasks.transcribe_task")
-def transcribe_task(file_path, save_output=True, language=None, initial_prompt=None):
-    """Celery task to transcribe audio file only (no summarization)"""
-    if not os.path.exists(file_path):
-        return {"error": f"File not found: {file_path}"}
-        
-    print(f"Processing audio file: {file_path}")
+def transcribe_task(file_path, save_output=True, language=None, initial_prompt=None, model=None):
+    """
+    Celery task to transcribe an audio file
     
+    Args:
+        file_path: Path to the audio file
+        save_output: Whether to save the output to a file
+        language: Language code to use for transcription
+        initial_prompt: Initial prompt to guide transcription
+        model: Whisper model to use
+    
+    Returns:
+        Dictionary with transcription results
+    """
     try:
-        # Create metadata for recording
+        task_id = transcribe_task.request.id
+        
+        # Send status update - STARTED with task info
+        model_name = model or MODEL_NAME
+        status_msg = f"Starting transcription with {model_name} model"
+        send_task_update(task_id, "STARTED", None, status_msg)
+        
+        # Validate model
+        valid_models = ["tiny", "base", "small", "medium", "large-v3"]
+        if model_name not in valid_models:
+            raise ValueError(f"Invalid model: {model_name}. Must be one of: {', '.join(valid_models)}")
+        
+        # Validate and check file
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"File not found: {file_path}")
+            
+        print(f"Processing audio file: {file_path} with {model_name} model")
+        
+        # Use default language if not specified
+        if not language:
+            language = DEFAULT_LANGUAGE
+        
+        # Send status update - PROCESSING with more details
+        send_task_update(task_id, "PROGRESS", None, f"Starting transcription with {model_name} model in {language} (10%)")
+        print(f"Starting audio transcription with language: {language} using {model_name} model")
+        
+        # Load model
+        send_task_update(task_id, "PROGRESS", None, f"Loading {model_name} model (20%)")
+        print(f"Loading Whisper model: {model_name}")
+        model_instance = whisper.load_model(model_name, device=device)
+        print(f"Model loaded. Transcribing...")
+        send_task_update(task_id, "PROGRESS", None, f"Model loaded. Processing audio (30%)")
+        
+        # Record start time
         start_time = time.time()
-        start_datetime = datetime.datetime.now()
         
-        # Get file creation time if possible
-        try:
-            file_stat = os.stat(file_path)
-            file_creation_time = datetime.datetime.fromtimestamp(file_stat.st_ctime)
-            file_modification_time = datetime.datetime.fromtimestamp(file_stat.st_mtime)
-        except:
-            file_creation_time = None
-            file_modification_time = None
-        
-        # Transcribe audio
-        print(f"Starting audio transcription with language: {language or DEFAULT_LANGUAGE}...")
-        transcription_data = transcribe_audio(file_path, language, initial_prompt)
-        transcription_text = transcription_data.get("text", "").strip()
-        print(f"Transcription complete. Text length: {len(transcription_text)} chars")
-        
-        # Check if we got any text from transcription
-        if not transcription_text:
-            print("Warning: Transcription produced empty text!")
-        
-        # Calculate basic recording data
-        end_time = time.time()
-        end_datetime = datetime.datetime.now()
-        processing_duration = end_time - start_time
-        
-        # Create minimal recording data
-        recording_data = {
-            "start_datetime": start_datetime,
-            "end_datetime": end_datetime,
-            "duration_seconds": processing_duration,
-            "start_time": start_time,
-            "end_time": end_time,
-            "file_metadata": {
-                "path": file_path,
-                "filename": os.path.basename(file_path),
-                "creation_time": file_creation_time.isoformat() if file_creation_time else None,
-                "modification_time": file_modification_time.isoformat() if file_modification_time else None
-            }
+        # Prepare transcription options
+        transcribe_options = {
+            "language": language,
+            "task": "transcribe",
+            "verbose": True
         }
         
-        # Export everything to JSON if requested
-        json_file = None
-        metadata = None
+        # Add initial prompt if provided
+        if initial_prompt:
+            print(f"Using initial prompt: {initial_prompt}")
+            transcribe_options["initial_prompt"] = initial_prompt
+            
+        # Print the language we're transcribing with
+        print(f"Transcribing with language: {language}")
         
+        # Send progress update - 40%
+        send_task_update(task_id, "PROGRESS", None, "Processing audio (40%)")
+            
+        # Perform transcription
+        result = model_instance.transcribe(file_path, **transcribe_options)
+        
+        # Calculate processing time
+        processing_time = time.time() - start_time
+        
+        # Send progress update - 80%
+        send_task_update(task_id, "PROGRESS", None, "Transcription complete (80%), finalizing result")
+        
+        # Prepare response
+        transcription_response = {
+            "text": result["text"],
+            "segments": result["segments"],
+            "language": result["language"],
+            "processing_time_seconds": processing_time,
+            "model": model_name
+        }
+        
+        # Save output to JSON file if requested
+        output_path = None
         if save_output:
-            audio_filename = os.path.basename(file_path)
-            json_file, metadata = export_to_json(
-                recording_data, 
-                transcription_data, 
-                audio_filename
-            )
+            # Generate output path
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_filename = f"transcript_{timestamp}.json"
+            output_directory = "transcripts"
+            
+            # Ensure output directory exists
+            if not os.path.exists(output_directory):
+                os.makedirs(output_directory)
+                
+            # Construct full path
+            output_path = os.path.join(output_directory, output_filename)
+            
+            # Write to file
+            with open(output_path, "w", encoding="utf-8") as f:
+                json.dump(transcription_response, f, ensure_ascii=False, indent=2)
+                
+            print(f"Transcription saved to {output_path}")
+            transcription_response["output_file"] = output_path
         
-        result = {
-            "transcription": {
-                "text": transcription_text,
-                "language": transcription_data.get("language", language or DEFAULT_LANGUAGE),
-                "processing_time_seconds": transcription_data.get("transcription_duration"),
-                "segments": transcription_data.get("segments", [])
-            },
-            "json_file": json_file
+        # Add file info to response
+        transcription_response["file_path"] = file_path
+        
+        # Build final response
+        response = {
+            "transcription": transcription_response
         }
         
-        if "temp/" in file_path and os.path.exists(file_path):
-            os.remove(file_path)
-            
-        return result
-            
+        # Send final update
+        send_task_update(task_id, "PROGRESS", None, "Transcription complete (95%)")
+        time.sleep(0.5)  # Ensure progress message is seen before SUCCESS message
+        send_task_update(task_id, "SUCCESS", response, "Transcription complete (100%)")
+        
+        # Return response for Celery result
+        return response
     except Exception as e:
-        if "temp/" in file_path and os.path.exists(file_path):
-            os.remove(file_path)
-        return {"error": f"Error processing file: {str(e)}"}
+        error_message = f"Error in transcription: {str(e)}"
+        print(error_message)
+        traceback.print_exc()
+        
+        # Create error response
+        response = {
+            "error": error_message
+        }
+        
+        # Send error update
+        task_id = transcribe_task.request.id
+        send_task_update(task_id, "FAILURE", response, "Transcription failed")
+        
+        # Re-raise for Celery
+        raise e
 
 @celery_app.task(name="meeting_notes_tasks.summarize_task")
 def summarize_task(text):
-    """Celery task to summarize text using Groq API"""
-    return summarize_with_groq(text)
+    """
+    Celery task to summarize a text using LLM
+    
+    Args:
+        text: The text to summarize
+    
+    Returns:
+        Dictionary with summary results
+    """
+    try:
+        task_id = summarize_task.request.id
+        
+        # Send status update - STARTED
+        send_task_update(task_id, "STARTED", None, "Preparing summary (0%)")
+        
+        # Validate input
+        if not text or not isinstance(text, str) or len(text) < 10:
+            raise ValueError("Invalid text provided for summarization")
+        
+        # Send progress update - beginning processing
+        send_task_update(task_id, "PROCESSING", None, "Analyzing text... (10%)")
+            
+        # Record start time
+        start_time = time.time()
+        
+        # Send progress update - 25%
+        send_task_update(task_id, "PROCESSING", None, "Generating summary (25%)")
+        
+        # Perform summarization
+        summary = summarize_with_groq(text)
+        
+        # Send progress update - 75%
+        send_task_update(task_id, "PROCESSING", None, "Summary generated (75%), post-processing...")
+        
+        # Calculate processing time
+        processing_time = time.time() - start_time
+        
+        # Prepare response
+        summary_response = {
+            "summary": summary,
+            "original_text": text[:500] + "..." if len(text) > 500 else text,  # Truncate for response
+            "model": GROQ_MODEL,
+            "processing_time_seconds": processing_time
+        }
+        
+        # Save output to JSON file
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_filename = f"summary_{timestamp}.json"
+        output_directory = "transcripts"
+        
+        # Ensure output directory exists
+        if not os.path.exists(output_directory):
+            os.makedirs(output_directory)
+            
+        # Construct full path
+        output_path = os.path.join(output_directory, output_filename)
+        
+        # Write to file
+        with open(output_path, "w", encoding="utf-8") as f:
+            json.dump(summary_response, f, ensure_ascii=False, indent=2)
+            
+        print(f"Summary saved to {output_path}")
+        summary_response["output_file"] = output_path
+        
+        # Build final response
+        response = {
+            "summary": summary_response
+        }
+        
+        # Send progress update - 90%
+        send_task_update(task_id, "PROCESSING", None, "Finalizing summary (90%)")
+        
+        # Send final update
+        send_task_update(task_id, "SUCCESS", response, "Summary complete (100%)")
+        
+        # Return response for Celery result
+        return response
+    except Exception as e:
+        error_message = f"Error in summarization: {str(e)}"
+        print(error_message)
+        traceback.print_exc()
+        
+        # Create error response
+        response = {
+            "error": error_message
+        }
+        
+        # Send error update
+        task_id = summarize_task.request.id
+        send_task_update(task_id, "FAILURE", response, "Summarization failed")
+        
+        # Re-raise for Celery
+        raise e
 
 # API Endpoints
 @app.get("/")
@@ -427,46 +636,74 @@ async def transcribe_endpoint(
     file: UploadFile = File(...),
     save_output: bool = Form(False),
     language: Optional[str] = None,
-    initial_prompt: Optional[str] = None
+    initial_prompt: Optional[str] = None,
+    model: Optional[str] = Form(None)
 ):
     """
-    Start async task to transcribe an audio file
+    Start async task to transcribe audio file
     
-    - **file**: Audio file to transcribe (WAV format recommended)
-    - **save_output**: Whether to save the output to a JSON file
-    - **language**: Language code (e.g., 'tr' for Turkish, 'en' for English)
-    - **initial_prompt**: Initial prompt to guide the transcription
+    - **file**: Audio file to transcribe
+    - **save_output**: Whether to save the output to a file
+    - **language**: Language code (e.g., 'tr' for Turkish)
+    - **initial_prompt**: Custom prompt to guide the transcription
+    - **model**: Whisper model size to use (tiny, base, small, medium, large-v3)
     """
-    # Create temp directory if it doesn't exist
-    ensure_export_directory()
+    # Validate model parameter
+    valid_models = ["tiny", "base", "small", "medium", "large-v3"]
+    if model and model not in valid_models:
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Invalid model: {model}. Valid models are: {', '.join(valid_models)}"
+        )
     
-    # Save uploaded file to temp directory
-    temp_file_path = f"temp/{uuid.uuid4()}.wav"
-    with open(temp_file_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
+    # Create a temporary directory to save the uploaded file
+    temp_dir = "temp"
+    if not os.path.exists(temp_dir):
+        os.makedirs(temp_dir)
     
-    # Start celery task
+    # Generate a unique filename
+    temp_filename = f"{uuid.uuid4()}.{file.filename.split('.')[-1]}"
+    temp_file_path = os.path.join(temp_dir, temp_filename)
+    
+    # Save the uploaded file
     try:
+        with open(temp_file_path, "wb") as buffer:
+            content = await file.read()
+            buffer.write(content)
+        
+        print(f"File saved to {temp_file_path}")
+        
+        # Get file size for logging
+        file_size = os.path.getsize(temp_file_path)
+        print(f"File size: {file_size / 1024 / 1024:.2f} MB")
+        
+        # Log selected model
+        selected_model = model if model else MODEL_NAME
+        print(f"Using model: {selected_model}")
+        
+        # Start async task
         task = transcribe_task.delay(
             temp_file_path, 
-            save_output,
-            language,
-            initial_prompt
+            save_output=save_output,
+            language=language,
+            initial_prompt=initial_prompt,
+            model=selected_model
         )
         
         # Save task information to database
         options = {
-            "save_output": save_output,
-            "language": language,
+            "file_path": temp_file_path,
+            "language": language or DEFAULT_LANGUAGE,
             "initial_prompt": initial_prompt,
-            "file_path": temp_file_path
+            "model": selected_model,
+            "save_output": save_output
         }
         db_manager.save_task(task.id, "transcribe", "PENDING", options)
         
         return {
             "task_id": task.id,
             "status": "PENDING",
-            "message": f"Transcription task started with language: {language or DEFAULT_LANGUAGE}"
+            "message": f"Transcription task started with model: {selected_model}"
         }
     except Exception as e:
         if os.path.exists(temp_file_path):
@@ -506,22 +743,29 @@ async def summarize_endpoint(request: SummarizeRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/task/{task_id}", response_model=TaskStatusResponse)
-async def get_task_status(task_id: str):
+async def get_task_status(task_id: str, include_embeddings: bool = False):
     """
     Check the status of a task
     
     - **task_id**: ID of the task to check
+    - **include_embeddings**: Whether to include vector embeddings in the response
     """
     # First check if we have the result in the database
-    task_with_response = db_manager.get_task_with_response(task_id)
+    task_with_response = db_manager.get_task_with_response(task_id, include_embeddings)
     
     if task_with_response and "result" in task_with_response:
         # Return result from database
-        return {
+        response = {
             "task_id": task_id,
             "status": task_with_response["status"],
             "result": task_with_response["result"]
         }
+        
+        # Include embeddings if requested and available
+        if include_embeddings and "embeddings" in task_with_response:
+            response["embeddings"] = task_with_response["embeddings"]
+            
+        return response
     
     # If not in database or no result yet, check Celery
     task_result = AsyncResult(task_id, app=celery_app)
@@ -541,6 +785,13 @@ async def get_task_status(task_id: str):
             
             # Save response to database
             db_manager.save_task_response(task_id, result)
+            
+            # Include embeddings if requested
+            if include_embeddings:
+                # Get the response with embeddings
+                saved_response = db_manager.get_task_response(task_id, True)
+                if saved_response and "embeddings" in saved_response:
+                    response["embeddings"] = saved_response["embeddings"]
             
             # Remove task from Celery backend
             task_result.forget()
@@ -608,19 +859,29 @@ async def get_transcription_text(task_id: str):
     return {"text": result["transcription"]["text"]}
 
 @app.get("/tasks", response_model=List[Dict[str, Any]])
-async def list_tasks(limit: int = 100, offset: int = 0):
+async def list_tasks(limit: int = 100, offset: int = 0, include_embeddings: bool = False):
     """
-    List recent tasks with pagination
+    List all tasks with pagination
     
     - **limit**: Maximum number of tasks to return
     - **offset**: Number of tasks to skip
+    - **include_embeddings**: Whether to include vector embeddings in the response
     """
-    return db_manager.list_tasks(limit, offset)
+    return db_manager.list_tasks(limit, offset, include_embeddings)
 
 @app.get("/models")
 async def get_models():
     """Get information about available models and supported languages"""
     whisper_models = ["tiny", "base", "small", "medium", "large-v3"]
+    
+    # Model size and performance information
+    model_info = {
+        "tiny": {"size": "39M", "speed": "Very Fast", "accuracy": "Low"},
+        "base": {"size": "74M", "speed": "Fast", "accuracy": "Basic"},
+        "small": {"size": "244M", "speed": "Medium", "accuracy": "Good"},
+        "medium": {"size": "769M", "speed": "Slow", "accuracy": "Better"},
+        "large-v3": {"size": "1.5GB", "speed": "Very Slow", "accuracy": "Best"}
+    }
     
     # List of supported languages in Whisper
     supported_languages = {
@@ -643,6 +904,7 @@ async def get_models():
     return {
         "current_whisper_model": MODEL_NAME,
         "available_whisper_models": whisper_models,
+        "whisper_model_info": model_info,
         "current_summary_model": GROQ_MODEL,
         "device": device,
         "default_language": DEFAULT_LANGUAGE,

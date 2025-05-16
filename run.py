@@ -25,6 +25,7 @@ def parse_arguments():
     parser.add_argument("-w", "--workers", type=int, default=1, help="Number of Celery worker processes (default: 1)")
     parser.add_argument("--kill-existing", action="store_true", default=True, help="Kill existing Celery processes before starting")
     parser.add_argument("--reset-redis", action="store_true", help="Completely reset Redis database before starting")
+    parser.add_argument("--gui", action="store_true", help="Start the Streamlit frontend GUI")
     return parser.parse_args()
 
 def is_port_in_use(port):
@@ -229,6 +230,22 @@ def start_fastapi():
         text=True
     )
 
+def start_streamlit_frontend():
+    """Start the Streamlit frontend from webapp.py"""
+    print("Starting Streamlit frontend...")
+    env = os.environ.copy()
+    
+    # Ensure the Streamlit app can connect to the API
+    env["API_URL"] = "http://localhost:8000"
+    
+    return subprocess.Popen(
+        ["streamlit", "run", "src/webapp.py"],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True
+    )
+
 def log_output(process, prefix):
     """Log the output of a process with a prefix"""
     for line in iter(process.stdout.readline, ''):
@@ -298,20 +315,15 @@ def nuke_redis_if_worker_duplicates():
     return False
 
 def main():
-    # Parse command line arguments
     args = parse_arguments()
     
-    # Kill existing Celery processes if requested
     if args.kill_existing:
         kill_existing_celery_processes()
     
-    # Start Redis container
     redis_container = start_redis()
     
-    # Wait for Redis to be fully up
     time.sleep(3)
     
-    # Check if we need to reset Redis completely
     if args.reset_redis:
         print("Performing complete Redis reset as requested...")
         import redis
@@ -319,16 +331,13 @@ def main():
         r.flushall()
         print("✓ Redis database completely reset")
     else:
-        # Clean stale Celery tasks
         flush_redis_celery_keys()
     
-    # Start Celery worker and FastAPI app
     celery_process = start_celery_worker(args.workers)
     fastapi_process = start_fastapi()
     
     processes = [celery_process, fastapi_process]
     
-    # Setup log threads
     celery_log_thread = threading.Thread(
         target=log_output, 
         args=(celery_process, "MEETING-NOTES-WORKER"),
@@ -344,7 +353,20 @@ def main():
     celery_log_thread.start()
     fastapi_log_thread.start()
     
-    # Handle clean shutdown
+    streamlit_process = None
+    streamlit_log_thread = None
+    
+    if args.gui:
+        streamlit_process = start_streamlit_frontend()
+        processes.append(streamlit_process)
+        
+        streamlit_log_thread = threading.Thread(
+            target=log_output, 
+            args=(streamlit_process, "STREAMLIT-FRONTEND"),
+            daemon=True
+        )
+        streamlit_log_thread.start()
+    
     def signal_handler(sig, frame):
         cleanup(redis_container, processes)
         sys.exit(0)
@@ -352,18 +374,30 @@ def main():
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
     
+    print("\n" + "=" * 50)
+    print("Services:")
+    print("- API URL: http://localhost:8000")
+    if args.gui:
+        print("- GUI URL: http://localhost:8501")
+    print("\nPress Ctrl+C to stop all services")
+    print("=" * 50 + "\n")
+    
     try:
-        # Keep the main thread alive
         while True:
             time.sleep(1)
             
-            # Check if processes are still running
             if celery_process.poll() is not None:
                 print("Celery worker process exited with code:", celery_process.returncode)
                 break
                 
             if fastapi_process.poll() is not None:
                 print("FastAPI process exited with code:", fastapi_process.returncode)
+                break
+                
+            if args.gui and streamlit_process and streamlit_process.poll() is not None:
+                print("Streamlit process exited with code:", streamlit_process.returncode)
+                if streamlit_process.returncode != 0:
+                    print("Streamlit frontend crashed. Make sure streamlit is installed.")
                 break
                 
     except KeyboardInterrupt:
