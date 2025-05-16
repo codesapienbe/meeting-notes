@@ -96,6 +96,11 @@ pip install -r requirements.txt
 GROQ_API_KEY=your_groq_api_key_here
 ```
 
+> **Important**: The GROQ_API_KEY is required for the summarization feature to work. If you don't have a Groq API key:
+> 1. Sign up at https://console.groq.com/ and obtain an API key
+> 2. Create a `.env` file in the project root and add your key as shown above
+> 3. Make sure the `.env` file is properly loaded when you run the application
+
 ## Running the Application
 
 Instead of using docker-compose, you can now use the Python script to run all components:
@@ -134,6 +139,35 @@ Press Ctrl+C to stop all processes and the Redis container.
 ## API Endpoints
 
 - `POST /transcribe` - Upload an audio file for transcription
+  - Optional query parameters:
+    - `language`: Language code (e.g., 'tr' for Turkish, 'en' for English)
+    - `initial_prompt`: Custom prompt to guide the transcription
+    - `save_output`: Whether to save the output to a JSON file (default: false)
+
 - `POST /summarize` - Summarize a text
+
 - `GET /task/{task_id}` - Check the status of a task
-- `GET /models` - Get available models 
+
+- `GET /task/{task_id}/text` - Get just the transcription text from a completed task
+
+- `GET /models` - Get available models and supported languages
+
+## Language Support
+
+The application defaults to Turkish (tr), but you can specify a different language when transcribing:
+
+```bash
+# Example of transcribing with a different language
+curl -X POST "http://localhost:8000/transcribe?language=en" \
+  -F "file=@your_audio_file.wav"
+```
+
+Supported languages include:
+- English (en)
+- Turkish (tr)
+- German (de)
+- Spanish (es)
+- French (fr)
+- And many more...
+
+Check the `/models` endpoint for the full list of supported languages. 

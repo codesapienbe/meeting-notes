@@ -156,9 +156,15 @@ def save_audio_to_file(frames, filename):
     
     return filename
 
-def transcribe_audio(filename):
+def transcribe_audio(filename, language=None, initial_prompt=None):
     """Transcribe audio file to text and return full results"""
     print("Loading Whisper model...")
+    
+    # Use provided language or default
+    language = language or DEFAULT_LANGUAGE
+    initial_prompt = initial_prompt or INITIAL_PROMPT
+    
+    print(f"Transcribing with language: {language}")
     
     model = whisper.load_model(MODEL_NAME).to(device)
     print("Model loaded. Transcribing...")
@@ -168,8 +174,8 @@ def transcribe_audio(filename):
     
     result = model.transcribe(
         filename,
-        language=DEFAULT_LANGUAGE,  # Use Turkish
-        initial_prompt=INITIAL_PROMPT,
+        language=language,
+        initial_prompt=initial_prompt,
         fp16=(device == "cuda"),
         temperature=0.0,  # Deterministic output
         beam_size=5       # Better quality
@@ -188,7 +194,20 @@ def summarize_with_groq(text):
     if not GROQ_API_KEY:
         print("Groq API key not found.")
         return None
-        
+    
+    if not text or text.strip() == "":
+        print("Empty text provided to summarize_with_groq, nothing to summarize.")
+        return {
+            "summary": "Metin boş! Özetlenecek içerik bulunamadı.",
+            "model": GROQ_MODEL,
+            "processing_details": {
+                "timestamp": datetime.datetime.now().isoformat(),
+                "error": "Empty input text"
+            }
+        }
+    
+    print(f"Sending text to Groq API for summarization (length: {len(text)} chars)")
+    
     headers = {
         "Authorization": f"Bearer {GROQ_API_KEY}",
         "Content-Type": "application/json"
@@ -211,11 +230,26 @@ def summarize_with_groq(text):
     }
     
     try:
+        print("Making request to Groq API...")
         response = requests.post(GROQ_API_URL, headers=headers, json=payload)
-        response.raise_for_status()
         
+        # Print status code for debugging
+        print(f"Groq API response status code: {response.status_code}")
+        
+        # Handle different status codes
+        if response.status_code == 401:
+            print("Authentication error: Invalid Groq API key")
+            return {"error": "Invalid Groq API key", "summary": "API kimlik doğrulama hatası!"}
+            
+        if response.status_code != 200:
+            print(f"Groq API error: {response.text}")
+            return {"error": f"Groq API error: {response.status_code}", "summary": "API hatası!"}
+        
+        # Parse response if status code is 200
         result = response.json()
         summary = result["choices"][0]["message"]["content"]
+        
+        print(f"Successfully received summary from Groq (length: {len(summary)} chars)")
         
         return {
             "summary": summary,
@@ -225,13 +259,22 @@ def summarize_with_groq(text):
                 "tokens_used": result.get("usage", {})
             }
         }
+    except requests.exceptions.RequestException as e:
+        print(f"Network error when connecting to Groq API: {str(e)}")
+        return {"error": f"Network error: {str(e)}", "summary": "API bağlantı hatası!"}
+    except KeyError as e:
+        print(f"Unexpected Groq API response format: {str(e)}")
+        return {"error": f"Unexpected response format: {str(e)}", "summary": "API yanıt hatası!"}
     except Exception as e:
         print(f"Error summarizing with Groq API: {str(e)}")
-        return {"error": str(e)}
+        return {"error": str(e), "summary": "Özet oluşturma hatası!"}
 
 def export_to_json(recording_data, transcription_data, audio_filename=None, summary_data=None):
     """Export all data to a structured JSON file"""
     ensure_export_directory()
+    
+    # Get the language used for transcription
+    language = transcription_data.get("language", DEFAULT_LANGUAGE)
     
     # Create metadata structure
     metadata = {
@@ -245,7 +288,7 @@ def export_to_json(recording_data, transcription_data, audio_filename=None, summ
         },
         "transcription": {
             "model": MODEL_NAME,
-            "language": transcription_data.get("language", DEFAULT_LANGUAGE),
+            "language": language,
             "processing_time_seconds": transcription_data.get("transcription_duration"),
             "text": transcription_data.get("text", ""),
             "segments": transcription_data.get("segments", [])
@@ -254,7 +297,7 @@ def export_to_json(recording_data, transcription_data, audio_filename=None, summ
             "device": device,
             "timestamp": datetime.datetime.now().isoformat(),
             "audio_file": audio_filename,
-            "prompt_used": INITIAL_PROMPT,
+            "prompt_used": transcription_data.get("initial_prompt", INITIAL_PROMPT),
             "uuid": str(uuid.uuid4())
         }
     }
@@ -272,8 +315,8 @@ def export_to_json(recording_data, transcription_data, audio_filename=None, summ
 
 # Register Celery tasks
 @celery_app.task(name="voice2text_tasks.transcribe_task")
-def transcribe_task(file_path, save_output=True):
-    """Celery task to transcribe audio file and optionally summarize"""
+def transcribe_task(file_path, save_output=True, language=None, initial_prompt=None):
+    """Celery task to transcribe audio file only (no summarization)"""
     if not os.path.exists(file_path):
         return {"error": f"File not found: {file_path}"}
         
@@ -294,7 +337,14 @@ def transcribe_task(file_path, save_output=True):
             file_modification_time = None
         
         # Transcribe audio
-        transcription_data = transcribe_audio(file_path)
+        print(f"Starting audio transcription with language: {language or DEFAULT_LANGUAGE}...")
+        transcription_data = transcribe_audio(file_path, language, initial_prompt)
+        transcription_text = transcription_data.get("text", "").strip()
+        print(f"Transcription complete. Text length: {len(transcription_text)} chars")
+        
+        # Check if we got any text from transcription
+        if not transcription_text:
+            print("Warning: Transcription produced empty text!")
         
         # Calculate basic recording data
         end_time = time.time()
@@ -316,13 +366,6 @@ def transcribe_task(file_path, save_output=True):
             }
         }
         
-        # Generate summary using Groq API if API key is available
-        summary_data = None
-        if GROQ_API_KEY:
-            # Start summarize task
-            summary_task = summarize_task.delay(transcription_data["text"])
-            summary_data = summary_task.get(timeout=60)  # Wait for result with timeout
-        
         # Export everything to JSON if requested
         json_file = None
         metadata = None
@@ -332,29 +375,25 @@ def transcribe_task(file_path, save_output=True):
             json_file, metadata = export_to_json(
                 recording_data, 
                 transcription_data, 
-                audio_filename,
-                summary_data
+                audio_filename
             )
         
         result = {
             "transcription": {
-                "text": transcription_data["text"],
-                "language": transcription_data.get("language", DEFAULT_LANGUAGE),
+                "text": transcription_text,
+                "language": transcription_data.get("language", language or DEFAULT_LANGUAGE),
                 "processing_time_seconds": transcription_data.get("transcription_duration"),
                 "segments": transcription_data.get("segments", [])
             },
-            "summary": summary_data["summary"] if summary_data and "summary" in summary_data else None,
             "json_file": json_file
         }
         
-        # Clean up temp file if it exists and is in temp directory
         if "temp/" in file_path and os.path.exists(file_path):
             os.remove(file_path)
             
         return result
             
     except Exception as e:
-        # Clean up in case of error
         if "temp/" in file_path and os.path.exists(file_path):
             os.remove(file_path)
         return {"error": f"Error processing file: {str(e)}"}
@@ -372,13 +411,17 @@ async def root():
 @app.post("/transcribe", response_model=TaskResponse)
 async def transcribe_endpoint(
     file: UploadFile = File(...),
-    save_output: bool = Form(False)
+    save_output: bool = Form(False),
+    language: Optional[str] = None,
+    initial_prompt: Optional[str] = None
 ):
     """
     Start async task to transcribe an audio file
     
     - **file**: Audio file to transcribe (WAV format recommended)
     - **save_output**: Whether to save the output to a JSON file
+    - **language**: Language code (e.g., 'tr' for Turkish, 'en' for English)
+    - **initial_prompt**: Initial prompt to guide the transcription
     """
     # Create temp directory if it doesn't exist
     ensure_export_directory()
@@ -390,14 +433,18 @@ async def transcribe_endpoint(
     
     # Start celery task
     try:
-        task = transcribe_task.delay(temp_file_path, save_output)
+        task = transcribe_task.delay(
+            temp_file_path, 
+            save_output,
+            language,
+            initial_prompt
+        )
         return {
             "task_id": task.id,
             "status": "PENDING",
-            "message": "Transcription task started"
+            "message": f"Transcription task started with language: {language or DEFAULT_LANGUAGE}"
         }
     except Exception as e:
-        # Clean up in case of error
         if os.path.exists(temp_file_path):
             os.remove(temp_file_path)
         raise HTTPException(status_code=500, detail=str(e))
@@ -411,6 +458,11 @@ async def summarize_endpoint(request: SummarizeRequest):
     """
     if not GROQ_API_KEY:
         raise HTTPException(status_code=500, detail="Groq API key not configured")
+    
+    if not request.text or request.text.strip() == "":
+        raise HTTPException(status_code=400, detail="Empty text provided. Please provide text to summarize.")
+    
+    print(f"Starting summarization task for text of length: {len(request.text)} chars")
     
     try:
         task = summarize_task.delay(request.text)
@@ -444,16 +496,61 @@ async def get_task_status(task_id: str):
     
     return response
 
+@app.get("/task/{task_id}/text")
+async def get_transcription_text(task_id: str):
+    """
+    Get only the transcription text for a completed transcription task
+    
+    - **task_id**: ID of the transcription task
+    """
+    task_result = AsyncResult(task_id, app=celery_app)
+    
+    if not task_result.ready():
+        raise HTTPException(status_code=400, detail="Task is not complete yet")
+    
+    if not task_result.successful():
+        raise HTTPException(status_code=500, detail=f"Task failed: {str(task_result.result)}")
+    
+    result = task_result.get()
+    
+    if "error" in result:
+        raise HTTPException(status_code=500, detail=result["error"])
+    
+    if "transcription" not in result or "text" not in result["transcription"]:
+        raise HTTPException(status_code=500, detail="No transcription text found in result")
+    
+    return {"text": result["transcription"]["text"]}
+
 @app.get("/models")
 async def get_models():
-    """Get information about available models"""
+    """Get information about available models and supported languages"""
     whisper_models = ["tiny", "base", "small", "medium", "large-v3"]
+    
+    # List of supported languages in Whisper
+    supported_languages = {
+        "en": "English",
+        "tr": "Turkish",
+        "de": "German",
+        "es": "Spanish",
+        "fr": "French",
+        "it": "Italian",
+        "pt": "Portuguese",
+        "nl": "Dutch",
+        "ja": "Japanese",
+        "zh": "Chinese",
+        "ru": "Russian",
+        "ar": "Arabic",
+        "hi": "Hindi",
+        # Add more languages as needed
+    }
     
     return {
         "current_whisper_model": MODEL_NAME,
         "available_whisper_models": whisper_models,
         "current_summary_model": GROQ_MODEL,
-        "device": device
+        "device": device,
+        "default_language": DEFAULT_LANGUAGE,
+        "supported_languages": supported_languages
     }
 
 if __name__ == "__main__":

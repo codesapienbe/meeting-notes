@@ -118,6 +118,12 @@ def start_celery_worker():
     env["REDIS_HOST"] = "localhost"
     env["REDIS_PORT"] = str(REDIS_PORT)
     
+    # Ensure GROQ_API_KEY is passed to the worker
+    if "GROQ_API_KEY" in os.environ:
+        print("Using GROQ_API_KEY from environment")
+    else:
+        print("Warning: GROQ_API_KEY not found in environment. Summarization will not work.")
+    
     return subprocess.Popen(
         ["python", "src/tasks.py"],
         env=env,
@@ -133,6 +139,12 @@ def start_fastapi():
     env["REDIS_URL"] = f"redis://localhost:{REDIS_PORT}/0"
     env["REDIS_HOST"] = "localhost"
     env["REDIS_PORT"] = str(REDIS_PORT)
+    
+    # Ensure GROQ_API_KEY is passed to the API
+    if "GROQ_API_KEY" in os.environ:
+        print("Using GROQ_API_KEY from environment")
+    else:
+        print("Warning: GROQ_API_KEY not found in environment. Summarization will not work.")
     
     return subprocess.Popen(
         ["uvicorn", "src.restapi:app", "--host", "0.0.0.0", "--port", "8000"],
